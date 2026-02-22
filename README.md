@@ -93,5 +93,6 @@ make cluster-down
 ## 未來擴充
 
 - [ ] CronJob：每日將 PVC 內容上傳 S3
+- [ ] Sharding : 各個 Tool 有各自的 Vector ， 可能 500:1
 - [ ] TLS：Fluent Bit → Vector 加密傳輸
 - [ ] Vector HA：多 replica + 共享 RWX PVC
