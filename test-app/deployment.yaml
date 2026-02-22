@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tool-001
+  labels:
+    toolid: tool-001
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      toolid: tool-001
+  template:
+    metadata:
+      labels:
+        toolid: tool-001
+    spec:
+      volumes:
+        # Shared volume between app and Fluent Bit sidecar
+        - name: log-volume
+          emptyDir: {}
+        # Fluent Bit config from ConfigMap
+        - name: fluentbit-config
+          configMap:
+            name: fluentbit-config
+
+      containers:
+        # ── Main application container ──────────────────────────────────
+        - name: tool-app
+          image: test-app:latest
+          imagePullPolicy: Never          # for local kind testing
+          env:
+            - name: TOOL_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['toolid']
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+
+        # ── Fluent Bit sidecar ──────────────────────────────────────────
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.2
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+              readOnly: true
+            - name: fluentbit-config
+              mountPath: /fluent-bit/etc/fluent-bit.conf
+              subPath: fluent-bit.conf
+            - name: fluentbit-config
+              mountPath: /fluent-bit/etc/parsers-custom.conf
+              subPath: parsers-custom.conf
+          env:
+            - name: TOOL_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['toolid']
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+# Duplicate the above Deployment for additional tools, changing:
+#   metadata.name, labels.toolid, env TOOL_ID value
+# Example: tool-002
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tool-002
+  labels:
+    toolid: tool-002
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      toolid: tool-002
+  template:
+    metadata:
+      labels:
+        toolid: tool-002
+    spec:
+      volumes:
+        - name: log-volume
+          emptyDir: {}
+        - name: fluentbit-config
+          configMap:
+            name: fluentbit-config
+
+      containers:
+        - name: tool-app
+          image: test-app:latest
+          imagePullPolicy: Never
+          env:
+            - name: TOOL_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['toolid']
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.2
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+              readOnly: true
+            - name: fluentbit-config
+              mountPath: /fluent-bit/etc/fluent-bit.conf
+              subPath: fluent-bit.conf
+            - name: fluentbit-config
+              mountPath: /fluent-bit/etc/parsers-custom.conf
+              subPath: parsers-custom.conf
+          env:
+            - name: TOOL_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['toolid']
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

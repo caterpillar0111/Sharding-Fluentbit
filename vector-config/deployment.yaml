@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vector
+  template:
+    metadata:
+      labels:
+        app: vector
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+        - name: log-storage
+          persistentVolumeClaim:
+            claimName: vector-log-pvc
+        - name: vector-data
+          emptyDir: {}
+
+      containers:
+        - name: vector
+          image: timberio/vector:0.41.X-debian
+          args: ["--config", "/etc/vector/vector.yaml"]
+          ports:
+            - containerPort: 24224   # Fluent Forward protocol
+              name: fluent
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+            - name: log-storage
+              mountPath: /logs
+            - name: vector-data
+              mountPath: /vector-data-dir
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

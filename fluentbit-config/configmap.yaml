@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentbit-config
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Daemon        Off
+        Log_Level     info
+        Parsers_File  parsers-custom.conf
+
+    [INPUT]
+        Name              tail
+        Path              /var/log/app/*.log
+        Parser            nlog_plain
+        Tag               app.${TOOL_ID}
+        Refresh_Interval  5
+        Mem_Buf_Limit     10MB
+        Skip_Long_Lines   On
+        # Track read position so we don't re-send on restart
+        DB                /tmp/fluentbit-pos.db
+
+    [FILTER]
+        Name  record_modifier
+        Match app.*
+        Record toolid ${TOOL_ID}
+
+    [OUTPUT]
+        Name          forward
+        Match         app.*
+        Host          vector
+        Port          24224
+        Retry_Limit   5
+
+  parsers-custom.conf: |
+    [PARSER]
+        Name        nlog_plain
+        Format      regex
+        # Capture the whole line as "log" so the full NLog text (including
+        # timestamp) is forwarded intact to Vector.
+        Regex       ^(?<log>.+)$

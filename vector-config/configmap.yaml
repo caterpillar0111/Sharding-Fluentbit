@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+data:
+  vector.yaml: |
+    data_dir: /vector-data-dir
+
+    api:
+      enabled: true
+      address: "0.0.0.0:8686"
+
+    sources:
+      fluent_in:
+        type: fluent
+        address: "0.0.0.0:24224"
+
+    transforms:
+      add_date:
+        type: remap
+        inputs: [fluent_in]
+        source: |
+          # Ensure toolid field exists
+          .toolid = string!(.toolid)
+          # .timestamp from fluent source is always present
+          .date = format_timestamp!(.timestamp, format: "%Y-%m-%d")
+          # Fluent Bit forward puts raw line in "log"; rename to "message"
+          # so Vector's text codec can write it as plain text
+          .message = string(.log) ?? ""
+          del(.log)
+
+    sinks:
+      file_out:
+        type: file
+        inputs: [add_date]
+        path: "/logs/{{ toolid }}/{{ date }}/app.log"
+        encoding:
+          codec: text
+        idle_timeout_secs: 5
