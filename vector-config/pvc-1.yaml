@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: vector-log-pvc
+  name: vector-log-pvc-1
 spec:
   accessModes:
     - ReadWriteOnce

@@ -23,11 +23,15 @@ load: build
 ## ── Deploy ─────────────────────────────────────────────────────────────────
 
 deploy-vector:
-	kubectl apply -f vector-config/pvc.yaml
+	kubectl apply -f vector-config/pvc-0.yaml
+	kubectl apply -f vector-config/pvc-1.yaml
 	kubectl apply -f vector-config/configmap.yaml
-	kubectl apply -f vector-config/deployment.yaml
-	kubectl apply -f vector-config/service.yaml
-	kubectl rollout status deployment/vector
+	kubectl apply -f vector-config/service-0.yaml
+	kubectl apply -f vector-config/service-1.yaml
+	kubectl apply -f vector-config/deployment-0.yaml
+	kubectl apply -f vector-config/deployment-1.yaml
+	kubectl rollout status deployment/vector-0
+	kubectl rollout status deployment/vector-1
 
 deploy-apps: load
 	kubectl apply -f fluentbit-config/configmap.yaml
@@ -39,9 +43,10 @@ deploy-all: deploy-vector deploy-apps
 
 ## ── Observe ────────────────────────────────────────────────────────────────
 
-# Stream Vector logs
+# Stream Vector logs (usage: make logs-vector SHARD=0)
+SHARD ?= 0
 logs-vector:
-	kubectl logs -f deployment/vector -c vector
+	kubectl logs -f deployment/vector-$(SHARD) -c vector
 
 # Stream a specific tool's Fluent Bit sidecar  (usage: make logs-tool TOOL=tool-001)
 TOOL ?= tool-001
@@ -52,9 +57,9 @@ logs-tool:
 status:
 	kubectl get pods -o wide
 
-# Peek at files written inside Vector's PVC
+# Peek at files written inside Vector's PVC (usage: make browse-pvc SHARD=0)
 browse-pvc:
-	kubectl exec deployment/vector -- find /logs -type f | sort
+	kubectl exec deployment/vector-$(SHARD) -- find /logs -type f | sort
 
 ## ── Cleanup ────────────────────────────────────────────────────────────────
 

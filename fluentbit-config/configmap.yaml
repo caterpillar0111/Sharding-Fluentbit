@@ -18,25 +18,47 @@ data:
         Refresh_Interval  5
         Mem_Buf_Limit     10MB
         Skip_Long_Lines   On
-        # Track read position so we don't re-send on restart
         DB                /tmp/fluentbit-pos.db
 
+    # Step 1: attach toolid field
     [FILTER]
-        Name  record_modifier
-        Match app.*
+        Name   record_modifier
+        Match  app.*
         Record toolid ${TOOL_ID}
+
+    # Step 2: Lua computes slot (fnv32a % 256) and writes shard_id field
+    [FILTER]
+        Name    lua
+        Match   app.*
+        call    compute_shard
+        code    local function fnv32a(s) local h=2166136261 for i=1,#s do h=bit.bxor(h,string.byte(s,i)) h=bit.tobit(h*16777619) end return h end local SHARD_MAP={{from=0,to=127,shard="0"},{from=128,to=255,shard="1"}} function compute_shard(tag,ts,record) local slot=math.abs(fnv32a(record["toolid"] or ""))%256 for _,e in ipairs(SHARD_MAP) do if slot>=e.from and slot<=e.to then record["shard_id"]=e.shard record["slot"]=slot return 1,ts,record end end record["shard_id"]="0" record["slot"]=slot return 1,ts,record end
+
+    # Step 3: rewrite tag to shard.0 / shard.1 based on shard_id field
+    #         keep=false drops the original app.* record
+    [FILTER]
+        Name          rewrite_tag
+        Match         app.*
+        Rule          $shard_id ^(0)$ shard.0 false
+        Rule          $shard_id ^(1)$ shard.1 false
+        Emitter_Name  shard_router
 
     [OUTPUT]
         Name          forward
-        Match         app.*
-        Host          vector
+        Match         shard.0
+        Host          vector-0
+        Port          24224
+        Retry_Limit   5
+
+    [OUTPUT]
+        Name          forward
+        Match         shard.1
+        Host          vector-1
         Port          24224
         Retry_Limit   5
 
   parsers-custom.conf: |
     [PARSER]
-        Name        nlog_plain
-        Format      regex
-        # Capture the whole line as "log" so the full NLog text (including
-        # timestamp) is forwarded intact to Vector.
-        Regex       ^(?<log>.+)$
+        Name    nlog_plain
+        Format  regex
+        Regex   ^(?<log>.+)$
+
