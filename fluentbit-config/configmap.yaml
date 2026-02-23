@@ -27,6 +27,19 @@ data:
         Record toolid ${TOOL_ID}
 
     # Step 2: Lua computes slot (fnv32a % 256) and writes shard_id field
+    #
+    # 分片邏輯說明：
+    #   1. 對 toolid 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)
+    #   2. 查 SHARD_MAP 決定 slot 對應哪個 vector shard
+    #
+    # 擴充 shard 時只需修改 SHARD_MAP，規則：
+    #   - slot 總數永遠是 256，不變
+    #   - 現有的 slot 範圍不能改（否則已在線機台會被重新分配）
+    #   - 只能從現有 shard 的尾端切出範圍給新 shard
+    #
+    # 範例：從 2 個 shard 擴充到 3 個
+    #   原本：{from=0,to=127,shard="0"}, {from=128,to=255,shard="1"}
+    #   擴充：{from=0,to=127,shard="0"}, {from=128,to=191,shard="1"}, {from=192,to=255,shard="2"}
     [FILTER]
         Name    lua
         Match   app.*

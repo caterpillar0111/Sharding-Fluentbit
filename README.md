@@ -43,15 +43,25 @@ slot 0~127   → vector-0
 slot 128~255 → vector-1
 ```
 
+### SHARD_MAP 是什麼
+
+SHARD_MAP 是 slot 到 vector 的對應表。slot 總數固定 256，每台機台的 toolid 經過 hash 後會對應到其中一個 slot，slot 再對應到某個 vector。
+
+這樣設計的好處：直接用 `hash % vector數量` 的話，一旦增加 vector，幾乎所有機台都會重新分配，歷史 log 和新 log 會分散在不同 PVC。透過固定的 slot 層，增加 vector 時只需把部分 slot 範圍指向新 vector，其餘的完全不動。
+
 ### 擴充 Vector 時
 
-只需修改 SHARD_MAP，將部分 slot 範圍指向新的 vector，**已存在的 slot 範圍不動**，在線機台不需要重啟。
+只需修改 SHARD_MAP，將現有 shard 尾端的 slot 範圍切給新 vector。**已存在的 slot 範圍絕對不能改**，否則在線機台會被重新分配到不同 PVC，造成同一台機台的 log 散落在兩個地方。
 
 ```
-# 加入 vector-2 後的 SHARD_MAP 範例
+# 目前（2 個 vector）
+slot 0~127   → vector-0
+slot 128~255 → vector-1
+
+# 加入 vector-2 後
 slot 0~127   → vector-0  (不變)
-slot 128~191 → vector-1  (縮小)
-slot 192~255 → vector-2  (新增)
+slot 128~191 → vector-1  (縮小，但原有機台不受影響)
+slot 192~255 → vector-2  (新增，只有 slot 落在此範圍的新機台才會進來)
 ```
 
 ## 前置需求
