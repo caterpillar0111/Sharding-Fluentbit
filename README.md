@@ -142,6 +142,65 @@ Fluent Bit 會自動根據 toolid 的 hash 決定送往哪個 Vector，**無需�
    kubectl exec <pod-name> -c fluent-bit -- kill -HUP 1
    ```
 
+## Fluent Bit Buffer（Vector 斷線保護）
+
+Fluent Bit 啟用 filesystem buffer，Vector 短暫打不通時 log 不會遺失。
+
+### 機制說明
+
+| 情況 | 結果 |
+|---|---|
+| Vector 短暫打不通 | chunk 在 memory 持續 retry（指數退避） |
+| Vector 長時間打不通 | chunk overflow 到 `/tmp/flb-storage/` 磁碟 |
+| Vector 恢復後 | 積壓的 chunk 全部補送，不遺失 |
+| Fluent Bit container 重啟 | tail position DB 保留，重啟後從上次位置繼續讀 |
+| Pod 被刪除重建 | buffer 隨 pod 消失（需掛 PVC 才能保留） |
+
+### 監控積壓狀況（HTTP API）
+
+Fluent Bit 內建 HTTP monitoring server，透過 port-forward 查詢：
+
+```bash
+# port-forward 到本機
+kubectl port-forward pod/<tool-pod-name> 2020:2020
+
+# 查詢 storage 狀態
+curl http://localhost:2020/api/v1/storage
+```
+
+重要欄位：
+- `shard_router.chunks.busy` — 正在 retry 中的 chunk 數
+- `shard_router.chunks.total` — 積壓中的 chunk 總數
+- `shard_router.chunks.down` — 已 overflow 到磁碟的 chunk 數
+
+Vector 正常時 `busy=0`；Vector 打不通時 `busy` 數量會持續增加。
+
+### 手動測試斷線補送
+
+```bash
+# 1. 確認所有 pod 正常
+kubectl get pods
+
+# 2. 模擬 vector-0 下線
+kubectl scale deployment/vector-0 --replicas=0
+
+# 3. 觀察 Fluent Bit 開始 retry（另開 terminal）
+kubectl logs -f <tool-001-pod> -c fluent-bit | grep -E "retry|chunk"
+
+# 4. 查詢積壓狀況（另開 terminal）
+kubectl port-forward pod/<tool-001-pod> 2020:2020
+curl http://localhost:2020/api/v1/storage
+
+# 5. 恢復 vector-0
+kubectl scale deployment/vector-0 --replicas=1
+
+# 6. 確認補送完成（busy 歸零）
+curl http://localhost:2020/api/v1/storage
+
+# 7. 確認 PVC 資料完整
+kubectl exec <vector-0-pod> -c vector -- wc -l /logs/tool-001/$(date +%Y-%m-%d)/app.log
+```
+
 ## 未來擴充
 
 - [ ] CronJob：每日將 PVC 內容上傳 S3 後清理本地

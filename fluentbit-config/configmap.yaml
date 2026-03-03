@@ -5,10 +5,16 @@ metadata:
 data:
   fluent-bit.conf: |
     [SERVICE]
-        Flush         5
-        Daemon        Off
-        Log_Level     info
-        Parsers_File  parsers-custom.conf
+        Flush                     5
+        Daemon                    Off
+        Log_Level                 info
+        Parsers_File              parsers-custom.conf
+        storage.path              /tmp/flb-storage/
+        storage.sync              normal
+        storage.backlog.mem_limit 50M
+        HTTP_Server               On
+        HTTP_Listen               0.0.0.0
+        HTTP_Port                 2020
 
     [INPUT]
         Name              tail
@@ -17,6 +23,7 @@ data:
         Tag               app.${TOOL_ID}
         Refresh_Interval  5
         Mem_Buf_Limit     10MB
+        storage.type      filesystem
         Skip_Long_Lines   On
         DB                /tmp/fluentbit-pos.db
 
@@ -60,14 +67,14 @@ data:
         Match         shard.0
         Host          vector-0
         Port          24224
-        Retry_Limit   5
+        Retry_Limit   False
 
     [OUTPUT]
         Name          forward
         Match         shard.1
         Host          vector-1
         Port          24224
-        Retry_Limit   5
+        Retry_Limit   False
 
   parsers-custom.conf: |
     [PARSER]
