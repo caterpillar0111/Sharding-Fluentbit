@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vector
+  namespace: {{ .Values.namespace }}
+spec:
+  serviceName: vector-headless
+  replicas: {{ .Values.shards }}
+  selector:
+    matchLabels:
+      app: vector
+  template:
+    metadata:
+      labels:
+        app: vector
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+        - name: vector-data
+          emptyDir: {}
+      containers:
+        - name: vector
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          args: ["--config", "/etc/vector/vector.yaml"]
+          ports:
+            - containerPort: 24224
+              name: fluent
+            - containerPort: 8686
+              name: api
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+            - name: log-storage
+              mountPath: /logs
+            - name: vector-data
+              mountPath: /vector-data-dir
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+  # StatefulSet 自動為每個 Pod 建立獨立 PVC
+  # vector-0 → log-storage-vector-0
+  # vector-1 → log-storage-vector-1
+  volumeClaimTemplates:
+    - metadata:
+        name: log-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.storageClassName }}
+        storageClassName: {{ .Values.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

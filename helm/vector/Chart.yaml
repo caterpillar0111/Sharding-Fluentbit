@@ -1,0 +1,6 @@
+apiVersion: v2
+name: vector
+description: Vector log aggregator — per-namespace StatefulSet deployment
+type: application
+version: 0.1.0
+appVersion: "0.41.X"

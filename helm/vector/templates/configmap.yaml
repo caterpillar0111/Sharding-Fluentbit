@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: {{ .Values.namespace }}
+data:
+  vector.yaml: |
+    data_dir: /vector-data-dir
+
+    api:
+      enabled: true
+      address: "0.0.0.0:8686"
+
+    sources:
+      fluent_in:
+        type: fluent
+        address: "0.0.0.0:24224"
+
+    transforms:
+      add_date:
+        type: remap
+        inputs: [fluent_in]
+        source: |
+          .toolid = string!(.toolid)
+          .date = format_timestamp!(.timestamp, format: "%Y-%m-%d")
+          .message = string(.log) ?? ""
+          del(.log)
+
+    sinks:
+      file_out:
+        type: file
+        inputs: [add_date]
+        path: "/logs/{{ `{{ toolid }}` }}/{{ `{{ date }}` }}/app.log"
+        encoding:
+          codec: text
+        idle_timeout_secs: 5
+
+      console_out:
+        type: console
+        inputs: [add_date]
+        encoding:
+          codec: json

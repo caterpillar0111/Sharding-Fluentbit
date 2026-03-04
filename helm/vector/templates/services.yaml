@@ -1,0 +1,42 @@
+# Headless Service — StatefulSet 必要，提供穩定的 Pod DNS
+# vector-0.vector-headless.<namespace>.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: vector-headless
+  namespace: {{ .Values.namespace }}
+spec:
+  clusterIP: None
+  selector:
+    app: vector
+  ports:
+    - name: fluent
+      port: 24224
+    - name: api
+      port: 8686
+
+---
+# 每個 shard 產生一個獨立 Service
+# FLB 用 Host vector-0 / vector-1 連線時對應到這裡
+# 跨 namespace 時使用 FQDN：vector-0.<namespace>.svc.cluster.local
+{{- range $i, $e := until (.Values.shards | int) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vector-{{ $i }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  selector:
+    app: vector
+    statefulset.kubernetes.io/pod-name: vector-{{ $i }}
+  ports:
+    - name: fluent
+      port: 24224
+      targetPort: 24224
+      protocol: TCP
+    - name: api
+      port: 8686
+      targetPort: 8686
+      protocol: TCP
+{{- end }}

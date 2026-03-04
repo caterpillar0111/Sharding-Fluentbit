@@ -65,14 +65,14 @@ data:
     [OUTPUT]
         Name          forward
         Match         shard.0
-        Host          vector-0
+        Host          vector-0.ea-tapinfra.svc.cluster.local
         Port          24224
         Retry_Limit   False
 
     [OUTPUT]
         Name          forward
         Match         shard.1
-        Host          vector-1
+        Host          vector-1.ea-tapinfra.svc.cluster.local
         Port          24224
         Retry_Limit   False
 

@@ -1,8 +1,10 @@
 .PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean
 
-CLUSTER_NAME := log-poc
-IMAGE_NAME   := test-app
-IMAGE_TAG    := latest
+CLUSTER_NAME    := log-poc
+IMAGE_NAME      := test-app
+IMAGE_TAG       := latest
+VECTOR_NS       := ea-tapinfra
+HELM_RELEASE    := vector
 
 ## ── Cluster ────────────────────────────────────────────────────────────────
 
@@ -23,15 +25,10 @@ load: build
 ## ── Deploy ─────────────────────────────────────────────────────────────────
 
 deploy-vector:
-	kubectl apply -f vector-config/pvc-0.yaml
-	kubectl apply -f vector-config/pvc-1.yaml
-	kubectl apply -f vector-config/configmap.yaml
-	kubectl apply -f vector-config/service-0.yaml
-	kubectl apply -f vector-config/service-1.yaml
-	kubectl apply -f vector-config/deployment-0.yaml
-	kubectl apply -f vector-config/deployment-1.yaml
-	kubectl rollout status deployment/vector-0
-	kubectl rollout status deployment/vector-1
+	kubectl create namespace $(VECTOR_NS) --dry-run=client -o yaml | kubectl apply -f -
+	kubectl label namespace default vector-access=true --overwrite
+	helm upgrade --install $(HELM_RELEASE) ./helm/vector --set namespace=$(VECTOR_NS)
+	kubectl rollout status statefulset/vector -n $(VECTOR_NS)
 
 deploy-apps: load
 	kubectl apply -f fluentbit-config/configmap.yaml
@@ -46,7 +43,7 @@ deploy-all: deploy-vector deploy-apps
 # Stream Vector logs (usage: make logs-vector SHARD=0)
 SHARD ?= 0
 logs-vector:
-	kubectl logs -f deployment/vector-$(SHARD) -c vector
+	kubectl logs -f statefulset/vector --pod=$(HELM_RELEASE)-$(SHARD) -n $(VECTOR_NS)
 
 # Stream a specific tool's Fluent Bit sidecar  (usage: make logs-tool TOOL=tool-001)
 TOOL ?= tool-001
@@ -55,15 +52,17 @@ logs-tool:
 
 # Show pod status
 status:
-	kubectl get pods -o wide
+	@echo "=== apps (default) ===" && kubectl get pods -o wide
+	@echo "=== vector ($(VECTOR_NS)) ===" && kubectl get pods -n $(VECTOR_NS) -o wide
 
 # Peek at files written inside Vector's PVC (usage: make browse-pvc SHARD=0)
 browse-pvc:
-	kubectl exec deployment/vector-$(SHARD) -- find /logs -type f | sort
+	kubectl exec -n $(VECTOR_NS) vector-$(SHARD) -- find /logs -type f | sort
 
 ## ── Cleanup ────────────────────────────────────────────────────────────────
 
 clean:
 	kubectl delete -f test-app/deployment.yaml --ignore-not-found
 	kubectl delete -f fluentbit-config/configmap.yaml --ignore-not-found
-	kubectl delete -f vector-config/ --ignore-not-found
+	helm uninstall $(HELM_RELEASE) -n $(VECTOR_NS) --ignore-not-found 2>/dev/null || true
+	kubectl delete namespace $(VECTOR_NS) --ignore-not-found

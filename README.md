@@ -64,10 +64,29 @@ slot 128~191 → vector-1  (縮小，但原有機台不受影響)
 slot 192~255 → vector-2  (新增，只有 slot 落在此範圍的新機台才會進來)
 ```
 
+## 部署架構
+
+```
+namespace: ea-tapinfra（或其他 infra namespace）
+├── StatefulSet: vector  (replicas = shards)
+├── Service: vector-0, vector-1, ...  (per-shard)
+├── Service: vector-headless  (StatefulSet 必要)
+├── PVC: log-storage-vector-0, log-storage-vector-1, ...  (自動建立)
+└── NetworkPolicy: 限定有 vector-access=true label 的 namespace 才能連入
+
+namespace: <各機台 namespace>
+└── ConfigMap: fluentbit-config
+        Host vector-0.ea-tapinfra.svc.cluster.local
+        Host vector-1.ea-tapinfra.svc.cluster.local
+```
+
+Vector 以 **StatefulSet** 部署，每個 shard 有獨立 PVC，pod 重啟或 rolling upgrade 時資料不遺失。
+
 ## 前置需求
 
 - [kind](https://kind.sigs.k8s.io/)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
+- [helm](https://helm.sh/docs/intro/install/)
 - [Docker](https://www.docker.com/)
 
 ## 快速開始
@@ -76,7 +95,7 @@ slot 192~255 → vector-2  (新增，只有 slot 落在此範圍的新機台才�
 # 1. 建立 Kind cluster
 make cluster-up
 
-# 2. 部署 Vector aggregator (vector-0, vector-1)
+# 2. 部署 Vector（Helm，部署至 ea-tapinfra namespace）
 make deploy-vector
 
 # 3. Build 測試 App image 並部署（含 Fluent Bit sidecar）
@@ -86,10 +105,48 @@ make deploy-apps
 make deploy-all
 ```
 
+`deploy-vector` 會自動：
+- 建立 `ea-tapinfra` namespace（已存在則略過）
+- 將 `default` namespace 加上 `vector-access=true` label（允許 FLB 連入）
+- 以 Helm 安裝/升級 Vector StatefulSet
+
+## Helm 設定
+
+Vector 透過 [helm/vector/](helm/vector/) chart 管理，主要參數在 [helm/vector/values.yaml](helm/vector/values.yaml)：
+
+| 參數 | 預設值 | 說明 |
+|---|---|---|
+| `namespace` | `ea-tapinfra` | 部署目標 namespace |
+| `shards` | `2` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
+| `storage.size` | `10Gi` | 每個 shard 的 PVC 大小 |
+| `networkPolicy.enabled` | `true` | 是否啟用 NetworkPolicy |
+
+**部署至不同 namespace 或調整 shard 數：**
+
+```bash
+helm upgrade --install vector ./helm/vector \
+  --set namespace=ea-eatooling \
+  --set shards=3
+```
+
+**擴充 shard（2 → 3）：**
+
+```bash
+helm upgrade vector ./helm/vector --set shards=3
+# 自動新增 vector-2 pod、log-storage-vector-2 PVC、vector-2 Service
+# 現有 vector-0、vector-1 完全不動
+```
+
+**開通某 namespace 的 FLB 連線：**
+
+```bash
+kubectl label namespace <namespace> vector-access=true
+```
+
 ## 常用指令
 
 ```bash
-# 查看所有 Pod 狀態
+# 查看所有 Pod 狀態（含 ea-tapinfra）
 make status
 
 # 即時查看 Vector 日誌（SHARD=0 或 1）

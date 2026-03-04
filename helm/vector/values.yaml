@@ -1,0 +1,31 @@
+# 部署目標 namespace（通常是 ea-tapinfra 或 ea-eatooling）
+namespace: ea-tapinfra
+
+# Shard 數量 = StatefulSet replicas
+# 每個 shard 自動產生：一個 Pod、一個 PVC、一個 Service
+# 擴充時只增加數字，現有 shard 不受影響
+shards: 2
+
+image:
+  repository: timberio/vector
+  tag: 0.41.X-debian
+
+storage:
+  # 留空使用 cluster 預設 StorageClass
+  storageClassName: ""
+  size: 10Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# NetworkPolicy：限定哪些 namespace 可以連到 Vector
+networkPolicy:
+  enabled: true
+  allowedNamespaceLabel:
+    key: vector-access
+    value: "true"

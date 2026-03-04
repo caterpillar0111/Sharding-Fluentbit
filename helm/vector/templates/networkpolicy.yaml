@@ -1,0 +1,21 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vector-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: vector
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 24224
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.allowedNamespaceLabel.key }}: {{ .Values.networkPolicy.allowedNamespaceLabel.value | quote }}
+{{- end }}
