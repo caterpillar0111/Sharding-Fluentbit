@@ -39,4 +39,10 @@ spec:
       port: 8686
       targetPort: 8686
       protocol: TCP
+    {{- if $.Values.logReader.enabled }}
+    - name: log-reader
+      port: {{ $.Values.logReader.port }}
+      targetPort: {{ $.Values.logReader.port }}
+      protocol: TCP
+    {{- end }}
 {{- end }}

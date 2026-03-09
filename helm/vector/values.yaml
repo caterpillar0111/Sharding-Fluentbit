@@ -29,3 +29,18 @@ networkPolicy:
   allowedNamespaceLabel:
     key: vector-access
     value: "true"
+
+# Log Reader API sidecar（與 Vector 共享 PVC /logs 目錄）
+logReader:
+  enabled: true
+  image:
+    repository: log-reader
+    tag: latest
+  port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi

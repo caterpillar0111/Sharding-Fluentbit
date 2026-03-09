@@ -1,4 +1,4 @@
-.PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean
+.PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean build-log-reader load-log-reader deploy-log-reader query-log
 
 CLUSTER_NAME    := log-poc
 IMAGE_NAME      := test-app
@@ -22,6 +22,12 @@ build:
 load: build
 	kind load docker-image $(IMAGE_NAME):$(IMAGE_TAG) --name $(CLUSTER_NAME)
 
+build-log-reader:
+	docker build -t log-reader:latest ./log-reader
+
+load-log-reader: build-log-reader
+	kind load docker-image log-reader:latest --name $(CLUSTER_NAME)
+
 ## ── Deploy ─────────────────────────────────────────────────────────────────
 
 deploy-vector:
@@ -37,6 +43,18 @@ deploy-apps: load
 	kubectl rollout status deployment/tool-002
 
 deploy-all: deploy-vector deploy-apps
+
+# Build log-reader image, load to kind, and helm upgrade (usage: make deploy-log-reader)
+deploy-log-reader: load-log-reader
+	helm upgrade $(HELM_RELEASE) ./helm/vector
+	kubectl rollout status statefulset/vector -n $(VECTOR_NS)
+
+# Query log via log-reader API (usage: make query-log TOOL=tool-001)
+query-log:
+	kubectl port-forward -n $(VECTOR_NS) vector-0 8080:8080 &
+	sleep 1
+	curl -s "http://localhost:8080/logs?toolid=$(TOOL)" | python3 -m json.tool
+	kill %1 2>/dev/null || true
 
 ## ── Observe ────────────────────────────────────────────────────────────────
 

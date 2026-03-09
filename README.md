@@ -15,17 +15,20 @@ Pod (tool-001)                 Pod (tool-002)
 └──────┬───────────┘           └──────┬───────────┘
        │ shard.0 (forward)            │ shard.1 (forward)
        ▼                              ▼
-┌─────────────┐              ┌─────────────┐
-│  vector-0   │              │  vector-1   │
-│ (shard 0)   │              │ (shard 1)   │
-└──────┬──────┘              └──────┬──────┘
-       ▼                            ▼
-┌─────────────┐              ┌─────────────┐
-│   PVC-0     │              │   PVC-1     │
-│ /logs/      │              │ /logs/      │
-│  tool-001/  │              │  tool-002/  │
-│   {date}/   │              │   {date}/   │
-└─────────────┘              └─────────────┘
+┌──────────────────────┐    ┌──────────────────────┐
+│  vector-0 (shard 0)  │    │  vector-1 (shard 1)  │
+│  ─────────────────   │    │  ─────────────────   │
+│  Vector container    │    │  Vector container    │
+│  log-reader sidecar  │    │  log-reader sidecar  │
+│  :8080 /logs API     │    │  :8080 /logs API     │
+└──────────┬───────────┘    └──────────┬───────────┘
+           ▼                           ▼
+    ┌─────────────┐             ┌─────────────┐
+    │   PVC-0     │             │   PVC-1     │
+    │ /logs/      │             │ /logs/      │
+    │  tool-001/  │             │  tool-002/  │
+    │   {date}/   │             │   {date}/   │
+    └─────────────┘             └─────────────┘
 ```
 
 ## Sharding 機制
@@ -69,7 +72,9 @@ slot 192~255 → vector-2  (新增，只有 slot 落在此範圍的新機台才�
 ```
 namespace: ea-tapinfra（或其他 infra namespace）
 ├── StatefulSet: vector  (replicas = shards)
-├── Service: vector-0, vector-1, ...  (per-shard)
+│   ├── container: vector         (log 接收與寫入 PVC)
+│   └── container: log-reader     (sidecar，提供 HTTP 查詢 API :8080)
+├── Service: vector-0, vector-1, ...  (per-shard，含 port 8080)
 ├── Service: vector-headless  (StatefulSet 必要)
 ├── PVC: log-storage-vector-0, log-storage-vector-1, ...  (自動建立)
 └── NetworkPolicy: 限定有 vector-access=true label 的 namespace 才能連入
@@ -120,6 +125,8 @@ Vector 透過 [helm/vector/](helm/vector/) chart 管理，主要參數在 [helm/
 | `shards` | `2` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
 | `storage.size` | `10Gi` | 每個 shard 的 PVC 大小 |
 | `networkPolicy.enabled` | `true` | 是否啟用 NetworkPolicy |
+| `logReader.enabled` | `true` | 是否啟用 log-reader sidecar |
+| `logReader.port` | `8080` | log-reader HTTP port |
 
 **部署至不同 namespace 或調整 shard 數：**
 
@@ -143,6 +150,71 @@ helm upgrade vector ./helm/vector --set shards=3
 kubectl label namespace <namespace> vector-access=true
 ```
 
+## Log Reader API
+
+每個 Vector pod 內含 `log-reader` sidecar，提供 HTTP 查詢介面，使用者只需提供 `toolid` 即可取得 log。
+
+### API 規格
+
+```
+GET /logs?toolid={toolid}&date={date}
+  date 可選，預設今日（UTC）
+
+Response 200:
+{
+  "toolid": "tool-001",
+  "date": "2026-03-09",
+  "shard": "0",
+  "lines": ["line1", "line2", ...],
+  "total_lines": 231
+}
+
+Response 400: { "error": "toolid is required" }
+Response 404: { "error": "log not found" }
+```
+
+### 路由邏輯
+
+1. 任一 vector pod 都可以接收查詢
+2. log-reader 對 `toolid` 做 FNV-32a hash，計算應在哪個 shard
+3. 若 log 在本機 PVC → 直接讀取返回
+4. 若 log 在其他 shard → HTTP proxy 到對應的 `vector-N` pod
+5. 若找不到（hash mismatch）→ fallback 掃描所有 shard
+
+```
+client → vector-0:8080/logs?toolid=tool-002
+           │
+           ├─ computeShard("tool-002") → shard 1
+           │
+           └─ proxy → vector-1:8080/logs?toolid=tool-002&direct=true
+                          │
+                          └─ 讀 /logs/tool-002/{date}/app.log → 200 OK
+```
+
+### 查詢指令
+
+```bash
+# 用 Makefile（自動 port-forward + curl + 關閉）
+make query-log TOOL=tool-001
+make query-log TOOL=tool-002
+
+# 手動 port-forward 後用 Postman 或 curl
+kubectl port-forward -n ea-tapinfra vector-0 8080:8080
+
+curl "http://localhost:8080/logs?toolid=tool-001"
+curl "http://localhost:8080/logs?toolid=tool-001&date=2026-03-09"
+```
+
+### 更新 log-reader image
+
+```bash
+# 修改 log-reader/main.go 後
+make deploy-log-reader
+
+# kind 環境需額外 rollout restart（imagePullPolicy: Never 不自動拉新 image）
+kubectl rollout restart statefulset/vector -n ea-tapinfra
+```
+
 ## 常用指令
 
 ```bash
@@ -154,6 +226,10 @@ make logs-vector SHARD=0
 
 # 即時查看特定 tool 的 Fluent Bit 輸出
 make logs-tool TOOL=tool-001
+
+# 查詢 log（自動路由到正確 shard）
+make query-log TOOL=tool-001
+make query-log TOOL=tool-002
 
 # 查看特定 shard 的 PVC 內已寫入的檔案
 make browse-pvc SHARD=0
@@ -261,6 +337,6 @@ kubectl exec <vector-0-pod> -c vector -- wc -l /logs/tool-001/$(date +%Y-%m-%d)/
 ## 未來擴充
 
 - [ ] CronJob：每日將 PVC 內容上傳 S3 後清理本地
-- [ ] Log Reader API：sidecar 掛在 Vector pod 旁提供 HTTP 查詢介面
 - [ ] TLS：Fluent Bit → Vector 加密傳輸
 - [ ] 監控 PVC 用量：Prometheus alert 在快滿時通知
+- [ ] 修正 Lua FNV-32a hash bug（`bit.tobit(h*16777619)` → `bit.lshift` 實作），使 FLB 與 log-reader 使用相同 hash，消除 fallback 需求
