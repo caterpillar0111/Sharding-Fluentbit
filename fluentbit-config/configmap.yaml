@@ -33,33 +33,22 @@ data:
         Match  app.*
         Record toolid ${TOOL_ID}
 
-    # Step 2: Lua computes slot (fnv32a % 256) and writes shard_id field
-    #
-    # 分片邏輯說明：
-    #   1. 對 toolid 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)
-    #   2. 查 SHARD_MAP 決定 slot 對應哪個 vector shard
-    #
-    # 擴充 shard 時只需修改 SHARD_MAP，規則：
-    #   - slot 總數永遠是 256，不變
-    #   - 現有的 slot 範圍不能改（否則已在線機台會被重新分配）
-    #   - 只能從現有 shard 的尾端切出範圍給新 shard
-    #
-    # 範例：從 2 個 shard 擴充到 3 個
-    #   原本：{from=0,to=127,shard="0"}, {from=128,to=255,shard="1"}
-    #   擴充：{from=0,to=127,shard="0"}, {from=128,to=191,shard="1"}, {from=192,to=255,shard="2"}
+    # Step 2: Lua 依 log 的日期查對應版本的 SHARD_MAP，計算 shard_id
+    #         路由規則定義在 shard.lua，scale-up 時只改 shard.lua + SIGHUP
     [FILTER]
         Name    lua
         Match   app.*
+        script  /fluent-bit/etc/shard.lua
         call    compute_shard
-        code    local function fnv32a(s) local h=2166136261 for i=1,#s do h=bit.bxor(h,string.byte(s,i)) h=bit.tobit(h*16777619) end return h end local SHARD_MAP={{from=0,to=127,shard="0"},{from=128,to=255,shard="1"}} function compute_shard(tag,ts,record) local slot=math.abs(fnv32a(record["toolid"] or ""))%256 for _,e in ipairs(SHARD_MAP) do if slot>=e.from and slot<=e.to then record["shard_id"]=e.shard record["slot"]=slot return 1,ts,record end end record["shard_id"]="0" record["slot"]=slot return 1,ts,record end
 
-    # Step 3: rewrite tag to shard.0 / shard.1 based on shard_id field
+    # Step 3: rewrite tag to shard.0 / shard.1 / shard.2 based on shard_id field
     #         keep=false drops the original app.* record
     [FILTER]
         Name          rewrite_tag
         Match         app.*
         Rule          $shard_id ^(0)$ shard.0 false
         Rule          $shard_id ^(1)$ shard.1 false
+        Rule          $shard_id ^(2)$ shard.2 false
         Emitter_Name  shard_router
 
     [OUTPUT]
@@ -76,9 +65,82 @@ data:
         Port          24224
         Retry_Limit   False
 
+    [OUTPUT]
+        Name          forward
+        Match         shard.2
+        Host          vector-2.ea-tapinfra.svc.cluster.local
+        Port          24224
+        Retry_Limit   False
+
+  # ── Shard 路由規則（date-versioned）────────────────────────────────────────
+  #
+  # scale-up 操作說明：
+  #   1. 在 SHARD_MAP_VERSIONS 最前面插入新版本（effective 設為跨日日期）
+  #   2. kubectl apply -f fluentbit-config/configmap.yaml
+  #   3. 對所有 FLB pod 執行 kill -HUP 1
+  #   4. 跨日後新日期的 log 自動走新 SHARD_MAP，舊日期不受影響
+  #
+  # 同步更新：helm/vector/values.yaml 的 shardMap 需與最新版本一致
+  #
+  shard.lua: |
+    -- SHARD_MAP_VERSIONS：date-versioned 路由表
+    -- 按 effective 日期降序排列，最新版本在最前面
+    local SHARD_MAP_VERSIONS = {
+        -- ── 2026-04-01 擴充至 3 shards ──────────────────────────────────
+        {
+            effective = "2026-04-01",
+            map = {
+                {from=0,   to=84,  shard="0"},
+                {from=85,  to=170, shard="1"},
+                {from=171, to=255, shard="2"},
+            }
+        },
+        -- ── 初始版本（2 shards，永遠是最終 fallback）─────────────────────
+        {
+            effective = "2000-01-01",
+            map = {
+                {from=0,   to=127, shard="0"},
+                {from=128, to=255, shard="1"},
+            }
+        },
+    }
+
+    local function fnv32a(s)
+        local h = 2166136261
+        for i = 1, #s do
+            h = bit.bxor(h, string.byte(s, i))
+            h = bit.tobit(h * 16777619)
+        end
+        return h
+    end
+
+    local function get_shard_map(date)
+        for _, v in ipairs(SHARD_MAP_VERSIONS) do
+            if date >= v.effective then
+                return v.map
+            end
+        end
+        return SHARD_MAP_VERSIONS[#SHARD_MAP_VERSIONS].map
+    end
+
+    function compute_shard(tag, ts, record)
+        local date      = os.date("%Y-%m-%d", ts)
+        local shard_map = get_shard_map(date)
+        local slot      = math.abs(fnv32a(record["toolid"] or "")) % 256
+        for _, e in ipairs(shard_map) do
+            if slot >= e.from and slot <= e.to then
+                record["shard_id"] = e.shard
+                record["slot"]     = slot
+                return 1, ts, record
+            end
+        end
+        record["shard_id"] = "0"
+        record["slot"]     = slot
+        return 1, ts, record
+    end
+
   parsers-custom.conf: |
     [PARSER]
         Name    nlog_plain
         Format  regex
         Regex   ^(?<log>.+)$
-
