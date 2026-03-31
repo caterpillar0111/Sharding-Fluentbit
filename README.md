@@ -11,71 +11,75 @@ Pod (tool-001)                 Pod (tool-002)
 │  /var/log/app/   │           │  /var/log/app/   │
 │       ↓          │           │       ↓          │
 │  Fluent Bit      │           │  Fluent Bit      │
-│  (Lua sharding)  │           │  (Lua sharding)  │
+│  (shard.lua)     │           │  (shard.lua)     │
 └──────┬───────────┘           └──────┬───────────┘
        │ shard.0 (forward)            │ shard.1 (forward)
        ▼                              ▼
-┌─────────────┐              ┌─────────────┐
-│  vector-0   │              │  vector-1   │
-│ (shard 0)   │              │ (shard 1)   │
-└──────┬──────┘              └──────┬──────┘
-       ▼                            ▼
-┌─────────────┐              ┌─────────────┐
-│   PVC-0     │              │   PVC-1     │
-│ /logs/      │              │ /logs/      │
-│  tool-001/  │              │  tool-002/  │
-│   {date}/   │              │   {date}/   │
-└─────────────┘              └─────────────┘
+┌──────────────────────┐    ┌──────────────────────┐
+│  vector-0 (shard 0)  │    │  vector-1 (shard 1)  │
+│  ─────────────────   │    │  ─────────────────   │
+│  Vector container    │    │  Vector container    │
+│  log-reader sidecar  │    │  log-reader sidecar  │
+│  :8080 /logs API     │    │  :8080 /logs API     │
+└──────────┬───────────┘    └──────────┬───────────┘
+           ▼                           ▼
+    ┌─────────────┐             ┌─────────────┐
+    │   PVC-0     │             │   PVC-1     │
+    │ /logs/      │             │ /logs/      │
+    │  tool-001/  │             │  tool-002/  │
+    │   {date}/   │             │   {date}/   │
+    └─────────────┘             └─────────────┘
 ```
 
 ## Sharding 機制
 
-Fluent Bit sidecar 內嵌 Lua script，對 `toolid` 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)，再查 SHARD_MAP 決定送往哪個 Vector。
+Fluent Bit sidecar 執行 [fluentbit-config/shard.lua](fluentbit-config/shard.lua)，對 `toolid` 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)，再依 log 的**日期**查對應版本的 SHARD_MAP 決定送往哪個 Vector。
 
 ```
-toolid → fnv32a(toolid) % 256 = slot → SHARD_MAP → vector-0 or vector-1
-```
-
-SHARD_MAP 定義在 [fluentbit-config/configmap.yaml](fluentbit-config/configmap.yaml)：
-
-```
-slot 0~127   → vector-0
-slot 128~255 → vector-1
+toolid → fnv32a(toolid) % 256 = slot
+log date → 查 SHARD_MAP_VERSIONS → 選對應版本的 SHARD_MAP
+slot → SHARD_MAP → vector-0 or vector-1
 ```
 
 ### SHARD_MAP 是什麼
 
 SHARD_MAP 是 slot 到 vector 的對應表。slot 總數固定 256，每台機台的 toolid 經過 hash 後會對應到其中一個 slot，slot 再對應到某個 vector。
 
-這樣設計的好處：直接用 `hash % vector數量` 的話，一旦增加 vector，幾乎所有機台都會重新分配，歷史 log 和新 log 會分散在不同 PVC。透過固定的 slot 層，增加 vector 時只需把部分 slot 範圍指向新 vector，其餘的完全不動。
+### SHARD_MAP_VERSIONS（日期版本化）
 
-### 擴充 Vector 時
+路由規則採用**日期版本化**設計，讓 scale-up 可以在跨日時自動切換，不需要停機：
 
-只需修改 SHARD_MAP，將現有 shard 尾端的 slot 範圍切給新 vector。**已存在的 slot 範圍絕對不能改**，否則在線機台會被重新分配到不同 PVC，造成同一台機台的 log 散落在兩個地方。
-
+```lua
+-- fluentbit-config/shard.lua
+local SHARD_MAP_VERSIONS = {
+    {
+        effective = "2026-04-01",   -- 從這天起的 log 走新規則
+        map = {{from=0,to=84,shard="0"},{from=85,to=170,shard="1"},{from=171,to=255,shard="2"}}
+    },
+    {
+        effective = "2000-01-01",   -- 初始版本（永遠是 fallback）
+        map = {{from=0,to=127,shard="0"},{from=128,to=255,shard="1"}}
+    },
+}
 ```
-# 目前（2 個 vector）
-slot 0~127   → vector-0
-slot 128~255 → vector-1
 
-# 加入 vector-2 後
-slot 0~127   → vector-0  (不變)
-slot 128~191 → vector-1  (縮小，但原有機台不受影響)
-slot 192~255 → vector-2  (新增，只有 slot 落在此範圍的新機台才會進來)
-```
+FLB 用 log 的 timestamp date 查表，找到第一個 `date >= effective` 的版本。**同一日期的資料永遠落在同一個 PVC**，S3 搬移不會有跨 PVC 碎片問題。
 
 ## 部署架構
 
 ```
 namespace: ea-tapinfra（或其他 infra namespace）
 ├── StatefulSet: vector  (replicas = shards)
-├── Service: vector-0, vector-1, ...  (per-shard)
+│   ├── container: vector         (log 接收與寫入 PVC)
+│   └── container: log-reader     (sidecar，提供 HTTP 查詢 API :8080)
+├── Service: vector-0, vector-1, ...  (per-shard，含 port 8080)
 ├── Service: vector-headless  (StatefulSet 必要)
 ├── PVC: log-storage-vector-0, log-storage-vector-1, ...  (自動建立)
 └── NetworkPolicy: 限定有 vector-access=true label 的 namespace 才能連入
 
 namespace: <各機台 namespace>
 └── ConfigMap: fluentbit-config
+        script /fluent-bit/etc/shard.lua  (SHARD_MAP_VERSIONS)
         Host vector-0.ea-tapinfra.svc.cluster.local
         Host vector-1.ea-tapinfra.svc.cluster.local
 ```
@@ -118,30 +122,114 @@ Vector 透過 [helm/vector/](helm/vector/) chart 管理，主要參數在 [helm/
 |---|---|---|
 | `namespace` | `ea-tapinfra` | 部署目標 namespace |
 | `shards` | `2` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
+| `shardMap` | 見 values.yaml | log-reader 路由表，與 shard.lua 最新版本同步 |
 | `storage.size` | `10Gi` | 每個 shard 的 PVC 大小 |
 | `networkPolicy.enabled` | `true` | 是否啟用 NetworkPolicy |
-
-**部署至不同 namespace 或調整 shard 數：**
-
-```bash
-helm upgrade --install vector ./helm/vector \
-  --set namespace=ea-eatooling \
-  --set shards=3
-```
-
-**擴充 shard（2 → 3）：**
-
-```bash
-helm upgrade vector ./helm/vector --set shards=3
-# 自動新增 vector-2 pod、log-storage-vector-2 PVC、vector-2 Service
-# 現有 vector-0、vector-1 完全不動
-```
+| `logReader.enabled` | `true` | 是否啟用 log-reader sidecar |
+| `logReader.port` | `8080` | log-reader HTTP port |
 
 **開通某 namespace 的 FLB 連線：**
 
 ```bash
 kubectl label namespace <namespace> vector-access=true
 ```
+
+## Log Reader API
+
+每個 Vector pod 內含 `log-reader` sidecar，提供 HTTP 查詢介面，使用者只需提供 `toolid` 即可取得 log。
+
+### API 規格
+
+```
+GET /logs?toolid={toolid}&date={date}
+  date 可選，預設今日（UTC）
+
+Response 200:
+{
+  "toolid": "tool-001",
+  "date": "2026-03-31",
+  "shard": "0",
+  "lines": ["line1", "line2", ...],
+  "total_lines": 231
+}
+
+Response 400: { "error": "toolid is required" }
+Response 404: { "error": "log not found" }
+```
+
+### 路由邏輯
+
+1. 任一 vector pod 都可以接收查詢
+2. log-reader 對 `toolid` 做 FNV-32a hash，計算應在哪個 shard
+3. 若 log 在本機 PVC → 直接讀取返回
+4. 若 log 在其他 shard → HTTP proxy 到對應的 `vector-N` pod
+5. 若找不到（hash mismatch）→ fallback 掃描所有 shard
+
+### 查詢指令
+
+```bash
+# 用 Makefile（自動 port-forward + curl + 關閉）
+make query-log TOOL=tool-001
+make query-log TOOL=tool-002
+
+# 手動 port-forward 後用 Postman 或 curl
+kubectl port-forward -n ea-tapinfra vector-0 8080:8080
+
+curl "http://localhost:8080/logs?toolid=tool-001"
+curl "http://localhost:8080/logs?toolid=tool-001&date=2026-03-31"
+```
+
+### 更新 log-reader image
+
+```bash
+# 修改 log-reader/main.go 後
+make deploy-log-reader
+
+# kind 環境需額外 rollout restart（imagePullPolicy: Never 不自動拉新 image）
+kubectl rollout restart statefulset/vector -n ea-tapinfra
+```
+
+## Shard Scale-up 流程（零停機）
+
+利用 SHARD_MAP_VERSIONS 的日期版本化機制，在跨日時自動切換，無需停機。
+
+### 步驟（以 2 → 3 shards 為例）
+
+**事前準備（任意時間，隔日生效）：**
+
+```bash
+# 1. 新增 vector-2 pod / PVC / Service
+helm upgrade vector ./helm/vector --set shards=3
+
+# 2. 在 shard.lua 最前面插入新版本（effective = 明天日期）
+#    同步更新 values.yaml 的 shardMap
+# 編輯 fluentbit-config/configmap.yaml 和 helm/vector/values.yaml
+
+# 3. 套用 FLB ConfigMap
+kubectl apply -f fluentbit-config/configmap.yaml
+
+# 4. FLB 熱重載（不重啟 Pod，buffer 不遺失）
+kubectl get pods -l app=tool -o name | xargs -I{} \
+  kubectl exec {} -c fluent-bit -- kill -HUP 1
+
+# 5. 更新 log-reader SHARD_MAP
+helm upgrade vector ./helm/vector
+kubectl rollout restart statefulset/vector -n ea-tapinfra
+```
+
+**跨日後（無需手動操作）：**
+- 新日期的 log 自動走新 SHARD_MAP → 進 vector-2
+- 舊日期的 log 依舊走舊 SHARD_MAP → 在原 shard
+- log-reader fallback 確保歷史查詢正常
+
+### 為什麼用日期而不是停機切換
+
+| | 停機換 MAP | 日期版本化 |
+|---|---|---|
+| 維護視窗 | 需要 | 不需要 |
+| 同日期資料跨 PVC | 可能 | 不會 |
+| 遲到的 log 路由正確 | 不一定 | ✅ |
+| S3 搬移資料完整 | 需確認 | ✅ |
 
 ## 常用指令
 
@@ -154,6 +242,10 @@ make logs-vector SHARD=0
 
 # 即時查看特定 tool 的 Fluent Bit 輸出
 make logs-tool TOOL=tool-001
+
+# 查詢 log（自動路由到正確 shard）
+make query-log TOOL=tool-001
+make query-log TOOL=tool-002
 
 # 查看特定 shard 的 PVC 內已寫入的檔案
 make browse-pvc SHARD=0
@@ -172,9 +264,9 @@ make cluster-down
 ```
 PVC-0 (/logs/)              PVC-1 (/logs/)
 ├── tool-001/               ├── tool-002/
-│   ├── 2026-02-23/         │   ├── 2026-02-23/
+│   ├── 2026-03-30/         │   ├── 2026-03-30/
 │   │   └── app.log         │   │   └── app.log
-│   └── 2026-02-24/         │   └── 2026-02-24/
+│   └── 2026-03-31/         │   └── 2026-03-31/
 │       └── app.log         │       └── app.log
 └── tool-003/               └── tool-004/
     └── ...                     └── ...
@@ -186,18 +278,6 @@ PVC-0 (/logs/)              PVC-1 (/logs/)
 修改 `metadata.name` 與所有 `toolid` label 值即可。
 
 Fluent Bit 會自動根據 toolid 的 hash 決定送往哪個 Vector，**無需更動任何設定**。
-
-## 調整 Sharding 規則（不重啟機台）
-
-1. 修改 [fluentbit-config/configmap.yaml](fluentbit-config/configmap.yaml) 的 `SHARD_MAP`
-2. Apply ConfigMap：
-   ```bash
-   kubectl apply -f fluentbit-config/configmap.yaml
-   ```
-3. 對各機台的 Fluent Bit 發送 SIGHUP（熱重載，不重啟 Pod）：
-   ```bash
-   kubectl exec <pod-name> -c fluent-bit -- kill -HUP 1
-   ```
 
 ## Fluent Bit Buffer（Vector 斷線保護）
 
@@ -215,52 +295,18 @@ Fluent Bit 啟用 filesystem buffer，Vector 短暫打不通時 log 不會遺失
 
 ### 監控積壓狀況（HTTP API）
 
-Fluent Bit 內建 HTTP monitoring server，透過 port-forward 查詢：
-
 ```bash
-# port-forward 到本機
 kubectl port-forward pod/<tool-pod-name> 2020:2020
-
-# 查詢 storage 狀態
 curl http://localhost:2020/api/v1/storage
 ```
 
 重要欄位：
 - `shard_router.chunks.busy` — 正在 retry 中的 chunk 數
-- `shard_router.chunks.total` — 積壓中的 chunk 總數
 - `shard_router.chunks.down` — 已 overflow 到磁碟的 chunk 數
-
-Vector 正常時 `busy=0`；Vector 打不通時 `busy` 數量會持續增加。
-
-### 手動測試斷線補送
-
-```bash
-# 1. 確認所有 pod 正常
-kubectl get pods
-
-# 2. 模擬 vector-0 下線
-kubectl scale deployment/vector-0 --replicas=0
-
-# 3. 觀察 Fluent Bit 開始 retry（另開 terminal）
-kubectl logs -f <tool-001-pod> -c fluent-bit | grep -E "retry|chunk"
-
-# 4. 查詢積壓狀況（另開 terminal）
-kubectl port-forward pod/<tool-001-pod> 2020:2020
-curl http://localhost:2020/api/v1/storage
-
-# 5. 恢復 vector-0
-kubectl scale deployment/vector-0 --replicas=1
-
-# 6. 確認補送完成（busy 歸零）
-curl http://localhost:2020/api/v1/storage
-
-# 7. 確認 PVC 資料完整
-kubectl exec <vector-0-pod> -c vector -- wc -l /logs/tool-001/$(date +%Y-%m-%d)/app.log
-```
 
 ## 未來擴充
 
 - [ ] CronJob：每日將 PVC 內容上傳 S3 後清理本地
-- [ ] Log Reader API：sidecar 掛在 Vector pod 旁提供 HTTP 查詢介面
 - [ ] TLS：Fluent Bit → Vector 加密傳輸
 - [ ] 監控 PVC 用量：Prometheus alert 在快滿時通知
+- [ ] 修正 Lua FNV-32a hash bug（`bit.tobit(h*16777619)` → `bit.lshift` 實作），使 FLB 與 log-reader 使用相同 hash，消除 fallback 需求
