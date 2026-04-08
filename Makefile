@@ -1,4 +1,6 @@
-.PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean
+.PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean \
+        build-log-reader load-log-reader deploy-log-reader \
+        build-aggregator load-aggregator deploy-aggregator query-log
 
 CLUSTER_NAME    := log-poc
 IMAGE_NAME      := test-app
@@ -59,10 +61,48 @@ status:
 browse-pvc:
 	kubectl exec -n $(VECTOR_NS) vector-$(SHARD) -- find /logs -type f | sort
 
+## ── Log Reader ─────────────────────────────────────────────────────────────
+
+LOG_READER_IMAGE := log-reader
+
+build-log-reader:
+	docker build -t $(LOG_READER_IMAGE):latest ./log-reader
+
+load-log-reader: build-log-reader
+	kind load docker-image $(LOG_READER_IMAGE):latest --name $(CLUSTER_NAME)
+
+deploy-log-reader: load-log-reader
+	helm upgrade --install $(HELM_RELEASE) ./helm/vector --set namespace=$(VECTOR_NS)
+	kubectl rollout restart statefulset/vector -n $(VECTOR_NS)
+	kubectl rollout status statefulset/vector -n $(VECTOR_NS)
+
+## ── Aggregator ──────────────────────────────────────────────────────────────
+
+AGGREGATOR_IMAGE := aggregator
+
+build-aggregator:
+	docker build -t $(AGGREGATOR_IMAGE):latest ./aggregator
+
+load-aggregator: build-aggregator
+	kind load docker-image $(AGGREGATOR_IMAGE):latest --name $(CLUSTER_NAME)
+
+deploy-aggregator: load-aggregator
+	kubectl apply -f aggregator/deployment.yaml
+	kubectl rollout status deployment/aggregator -n $(VECTOR_NS)
+
+# Query a toolid via aggregator (usage: make query-log TOOL=tool-001)
+query-log:
+	@echo "Port-forwarding aggregator on :8090 ..."; \
+	kubectl port-forward -n $(VECTOR_NS) svc/aggregator 8090:8090 &PF_PID=$$!; \
+	sleep 1; \
+	curl -s "http://localhost:8090/logs?toolid=$(TOOL)" | python3 -m json.tool; \
+	kill $$PF_PID 2>/dev/null || true
+
 ## ── Cleanup ────────────────────────────────────────────────────────────────
 
 clean:
 	kubectl delete -f test-app/deployment.yaml --ignore-not-found
 	kubectl delete -f fluentbit-config/configmap.yaml --ignore-not-found
+	kubectl delete -f aggregator/deployment.yaml --ignore-not-found
 	helm uninstall $(HELM_RELEASE) -n $(VECTOR_NS) --ignore-not-found 2>/dev/null || true
 	kubectl delete namespace $(VECTOR_NS) --ignore-not-found

@@ -29,6 +29,13 @@ Pod (tool-001)                 Pod (tool-002)
     │  tool-001/  │             │  tool-002/  │
     │   {date}/   │             │   {date}/   │
     └─────────────┘             └─────────────┘
+           ▲                           ▲
+           └──────────┬────────────────┘
+              ┌───────┴────────┐
+              │   Aggregator   │
+              │  :8090 /logs   │
+              │  /logs/all     │
+              └────────────────┘
 ```
 
 ## Sharding 機制
@@ -71,9 +78,11 @@ FLB 用 log 的 timestamp date 查表，找到第一個 `date >= effective` 的�
 namespace: ea-tapinfra（或其他 infra namespace）
 ├── StatefulSet: vector  (replicas = shards)
 │   ├── container: vector         (log 接收與寫入 PVC)
-│   └── container: log-reader     (sidecar，提供 HTTP 查詢 API :8080)
+│   └── container: log-reader     (sidecar，Flask，提供 HTTP 查詢 API :8080)
+├── Deployment: aggregator        (Flask，統一查詢入口 :8090)
 ├── Service: vector-0, vector-1, ...  (per-shard，含 port 8080)
 ├── Service: vector-headless  (StatefulSet 必要)
+├── Service: aggregator  (port 8090)
 ├── PVC: log-storage-vector-0, log-storage-vector-1, ...  (自動建立)
 └── NetworkPolicy: 限定有 vector-access=true label 的 namespace 才能連入
 
@@ -92,6 +101,7 @@ Vector 以 **StatefulSet** 部署，每個 shard 有獨立 PVC，pod 重啟或 r
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [helm](https://helm.sh/docs/intro/install/)
 - [Docker](https://www.docker.com/)
+- Python 3.12+（僅本機開發用，container 內已打包）
 
 ## 快速開始
 
@@ -105,7 +115,13 @@ make deploy-vector
 # 3. Build 測試 App image 並部署（含 Fluent Bit sidecar）
 make deploy-apps
 
-# 或一次完成所有步驟
+# 4. Build + 部署 log-reader（Python/Flask sidecar）
+make deploy-log-reader
+
+# 5. Build + 部署 Aggregator
+make deploy-aggregator
+
+# 或一次完成 Vector + Apps
 make deploy-all
 ```
 
@@ -136,7 +152,7 @@ kubectl label namespace <namespace> vector-access=true
 
 ## Log Reader API
 
-每個 Vector pod 內含 `log-reader` sidecar，提供 HTTP 查詢介面，使用者只需提供 `toolid` 即可取得 log。
+每個 Vector pod 內含 `log-reader` sidecar（Python/Flask），提供 HTTP 查詢介面。
 
 ### API 規格
 
@@ -153,6 +169,16 @@ Response 200:
   "total_lines": 231
 }
 
+GET /logs/shard/index?date={date}
+  回傳本 shard 在指定日期有 log 的 toolid 清單（僅 directory listing，不讀檔案內容）
+
+Response 200:
+{
+  "shard": "0",
+  "date": "2026-04-09",
+  "toolids": ["tool-001", "tool-003"]
+}
+
 Response 400: { "error": "toolid is required" }
 Response 404: { "error": "log not found" }
 ```
@@ -163,30 +189,77 @@ Response 404: { "error": "log not found" }
 2. log-reader 對 `toolid` 做 FNV-32a hash，計算應在哪個 shard
 3. 若 log 在本機 PVC → 直接讀取返回
 4. 若 log 在其他 shard → HTTP proxy 到對應的 `vector-N` pod
-5. 若找不到（hash mismatch）→ fallback 掃描所有 shard
+5. 若找不到（hash mismatch）→ fallback 掃描所有 shard 的本機 PVC
 
-### 查詢指令
-
-```bash
-# 用 Makefile（自動 port-forward + curl + 關閉）
-make query-log TOOL=tool-001
-make query-log TOOL=tool-002
-
-# 手動 port-forward 後用 Postman 或 curl
-kubectl port-forward -n ea-tapinfra vector-0 8080:8080
-
-curl "http://localhost:8080/logs?toolid=tool-001"
-curl "http://localhost:8080/logs?toolid=tool-001&date=2026-03-31"
-```
+> **Note on hash mismatch:** FLB Lua 的 FNV-32a 有 float64 精度 bug (`bit.tobit(h*16777619)`)，
+> 導致部分 toolid 被送到與 log-reader 計算結果不同的 shard。
+> log-reader 以 fallback 機制（`direct=true`）自動掃描其他 shard 補救，查詢結果仍正確。
 
 ### 更新 log-reader image
 
 ```bash
-# 修改 log-reader/main.go 後
+# 修改 log-reader/main.py 後
 make deploy-log-reader
 
-# kind 環境需額外 rollout restart（imagePullPolicy: Never 不自動拉新 image）
-kubectl rollout restart statefulset/vector -n ea-tapinfra
+# deploy-log-reader 已包含 rollout restart，kind 環境不需額外操作
+```
+
+## Aggregator API
+
+Aggregator 是一個獨立的 Flask service，提供**跨 shard 統一查詢**入口，適合下游需要批次拉取所有 toolid log 的場景。
+
+### API 規格
+
+```
+GET /logs?toolid={toolid}&date={date}
+  date 可選，預設今日（UTC）
+  平行掃所有 shard index → 找到 toolid 所在 shard → 拉取 content → merge
+
+Response 200:
+{
+  "toolid": "tool-001",
+  "date": "2026-04-09",
+  "shards": [0],
+  "lines": ["line1", "line2", ...],
+  "total_lines": 231
+}
+
+GET /logs/all?date={date}
+  回傳指定日期所有 toolid 清單（不含內容），供下游規劃 bulk 查詢
+
+Response 200:
+{
+  "date": "2026-04-09",
+  "total_tools": 42,
+  "toolids": ["tool-001", "tool-002", ...]
+}
+```
+
+### Cache 策略
+
+| 日期 | Cache 行為 |
+|---|---|
+| 過去日期 | 永久 cache（資料不會再變動） |
+| 今天 | 每次重新掃所有 shard index（避免 stale） |
+
+### 查詢指令
+
+```bash
+# 透過 Aggregator 查詢（自動 port-forward）
+make query-log TOOL=tool-001
+make query-log TOOL=tool-002
+
+# 手動 port-forward
+kubectl port-forward -n ea-tapinfra svc/aggregator 8090:8090
+
+curl "http://localhost:8090/logs?toolid=tool-001"
+curl "http://localhost:8090/logs/all"
+curl "http://localhost:8090/logs/all?date=2026-04-08"
+
+# 直接對 log-reader 查詢（單 shard）
+kubectl port-forward -n ea-tapinfra vector-0 8080:8080
+curl "http://localhost:8080/logs?toolid=tool-001"
+curl "http://localhost:8080/logs/shard/index"
 ```
 
 ## Shard Scale-up 流程（零停機）
@@ -212,15 +285,15 @@ kubectl apply -f fluentbit-config/configmap.yaml
 kubectl get pods -l app=tool -o name | xargs -I{} \
   kubectl exec {} -c fluent-bit -- kill -HUP 1
 
-# 5. 更新 log-reader SHARD_MAP
-helm upgrade vector ./helm/vector
-kubectl rollout restart statefulset/vector -n ea-tapinfra
+# 5. 更新 log-reader SHARD_MAP + 重新部署 aggregator（更新 SHARDS 數量）
+make deploy-log-reader
+kubectl set env deployment/aggregator SHARDS=3 -n ea-tapinfra
 ```
 
 **跨日後（無需手動操作）：**
 - 新日期的 log 自動走新 SHARD_MAP → 進 vector-2
 - 舊日期的 log 依舊走舊 SHARD_MAP → 在原 shard
-- log-reader fallback 確保歷史查詢正常
+- log-reader fallback + aggregator 全掃確保歷史查詢正常
 
 ### 為什麼用日期而不是停機切換
 
@@ -243,7 +316,7 @@ make logs-vector SHARD=0
 # 即時查看特定 tool 的 Fluent Bit 輸出
 make logs-tool TOOL=tool-001
 
-# 查詢 log（自動路由到正確 shard）
+# 查詢 log（透過 Aggregator，自動路由 + merge）
 make query-log TOOL=tool-001
 make query-log TOOL=tool-002
 
@@ -310,3 +383,4 @@ curl http://localhost:2020/api/v1/storage
 - [ ] TLS：Fluent Bit → Vector 加密傳輸
 - [ ] 監控 PVC 用量：Prometheus alert 在快滿時通知
 - [ ] 修正 Lua FNV-32a hash bug（`bit.tobit(h*16777619)` → `bit.lshift` 實作），使 FLB 與 log-reader 使用相同 hash，消除 fallback 需求
+- [ ] Aggregator：支援 scale-up 時同一 toolid 跨 shard merge 後再送 S3

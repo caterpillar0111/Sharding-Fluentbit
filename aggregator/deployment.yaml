@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregator
+  namespace: ea-tapinfra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aggregator
+  template:
+    metadata:
+      labels:
+        app: aggregator
+    spec:
+      containers:
+        - name: aggregator
+          image: aggregator:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8090
+              name: http
+          env:
+            - name: SHARDS
+              value: "2"
+            - name: NAMESPACE
+              value: ea-tapinfra
+            - name: LOG_READER_PORT
+              value: "8080"
+            - name: PORT
+              value: "8090"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aggregator
+  namespace: ea-tapinfra
+spec:
+  selector:
+    app: aggregator
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+      protocol: TCP
