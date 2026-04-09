@@ -29,6 +29,20 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+logReader:
+  enabled: true
+  image:
+    repository: log-reader
+    tag: latest
+  port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
 # NetworkPolicy：限定哪些 namespace 可以連到 Vector
 networkPolicy:
   enabled: true

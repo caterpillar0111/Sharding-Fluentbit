@@ -38,6 +38,33 @@ spec:
               mountPath: /vector-data-dir
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.logReader.enabled }}
+        - name: log-reader
+          image: {{ .Values.logReader.image.repository }}:{{ .Values.logReader.image.tag }}
+          imagePullPolicy: Never
+          ports:
+            - containerPort: {{ .Values.logReader.port }}
+              name: log-reader
+          env:
+            - name: MY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              value: {{ .Values.namespace }}
+            - name: LOG_DIR
+              value: /logs
+            - name: PORT
+              value: {{ .Values.logReader.port | quote }}
+            - name: SHARD_MAP
+              value: {{ include "vector.shardMap" . | quote }}
+          volumeMounts:
+            - name: log-storage
+              mountPath: /logs
+              readOnly: true
+          resources:
+            {{- toYaml .Values.logReader.resources | nindent 12 }}
+        {{- end }}
   # StatefulSet 自動為每個 Pod 建立獨立 PVC
   # vector-0 → log-storage-vector-0
   # vector-1 → log-storage-vector-1

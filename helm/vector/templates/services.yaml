@@ -14,6 +14,10 @@ spec:
       port: 24224
     - name: api
       port: 8686
+    {{- if .Values.logReader.enabled }}
+    - name: log-reader
+      port: {{ .Values.logReader.port }}
+    {{- end }}
 
 ---
 # 每個 shard 產生一個獨立 Service
@@ -39,4 +43,10 @@ spec:
       port: 8686
       targetPort: 8686
       protocol: TCP
+    {{- if $.Values.logReader.enabled }}
+    - name: log-reader
+      port: {{ $.Values.logReader.port }}
+      targetPort: {{ $.Values.logReader.port }}
+      protocol: TCP
+    {{- end }}
 {{- end }}
