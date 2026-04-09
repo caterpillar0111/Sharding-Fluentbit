@@ -40,37 +40,25 @@ Pod (tool-001)                 Pod (tool-002)
 
 ## Sharding 機制
 
-Fluent Bit sidecar 執行 [fluentbit-config/shard.lua](fluentbit-config/shard.lua)，對 `toolid` 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)，再依 log 的**日期**查對應版本的 SHARD_MAP 決定送往哪個 Vector。
+Fluent Bit sidecar 執行 [fluentbit-config/shard.lua](fluentbit-config/shard.lua)，對 `toolid` 做 FNV-32a hash，結果 mod 256 得到 slot (0~255)，再依 SHARD_MAP 決定送往哪個 Vector。
 
 ```
-toolid → fnv32a(toolid) % 256 = slot
-log date → 查 SHARD_MAP_VERSIONS → 選對應版本的 SHARD_MAP
-slot → SHARD_MAP → vector-0 or vector-1
+toolid → fnv32a(toolid) % 256 = slot → SHARD_MAP → vector-0 or vector-1
 ```
 
 ### SHARD_MAP 是什麼
 
 SHARD_MAP 是 slot 到 vector 的對應表。slot 總數固定 256，每台機台的 toolid 經過 hash 後會對應到其中一個 slot，slot 再對應到某個 vector。
 
-### SHARD_MAP_VERSIONS（日期版本化）
-
-路由規則採用**日期版本化**設計，讓 scale-up 可以在跨日時自動切換，不需要停機：
-
 ```lua
 -- fluentbit-config/shard.lua
-local SHARD_MAP_VERSIONS = {
-    {
-        effective = "2026-04-01",   -- 從這天起的 log 走新規則
-        map = {{from=0,to=84,shard="0"},{from=85,to=170,shard="1"},{from=171,to=255,shard="2"}}
-    },
-    {
-        effective = "2000-01-01",   -- 初始版本（永遠是 fallback）
-        map = {{from=0,to=127,shard="0"},{from=128,to=255,shard="1"}}
-    },
+local SHARD_MAP = {
+    {from=0,   to=127, shard="0"},
+    {from=128, to=255, shard="1"},
 }
 ```
 
-FLB 用 log 的 timestamp date 查表，找到第一個 `date >= effective` 的版本。**同一日期的資料永遠落在同一個 PVC**，S3 搬移不會有跨 PVC 碎片問題。
+scale-up 時直接修改 SHARD_MAP 並 apply configmap。同一 toolid 在切換前後可能分散在不同 shard，查詢時由 aggregator 自動 merge，不影響資料完整性。
 
 ## 部署架構
 
@@ -262,47 +250,26 @@ curl "http://localhost:8080/logs?toolid=tool-001"
 curl "http://localhost:8080/logs/shard/index"
 ```
 
-## Shard Scale-up 流程（零停機）
-
-利用 SHARD_MAP_VERSIONS 的日期版本化機制，在跨日時自動切換，無需停機。
+## Shard Scale-up 流程
 
 ### 步驟（以 2 → 3 shards 為例）
-
-**事前準備（任意時間，隔日生效）：**
 
 ```bash
 # 1. 新增 vector-2 pod / PVC / Service
 helm upgrade vector ./helm/vector --set shards=3
 
-# 2. 在 shard.lua 最前面插入新版本（effective = 明天日期）
-#    同步更新 values.yaml 的 shardMap
-# 編輯 fluentbit-config/configmap.yaml 和 helm/vector/values.yaml
+# 2. 修改 fluentbit-config/shard.lua 的 SHARD_MAP（重新均分或追加 shard）
+#    同步修改 helm/vector/values.yaml 的 shardMap
 
 # 3. 套用 FLB ConfigMap
 kubectl apply -f fluentbit-config/configmap.yaml
 
-# 4. FLB 熱重載（不重啟 Pod，buffer 不遺失）
-kubectl get pods -l app=tool -o name | xargs -I{} \
-  kubectl exec {} -c fluent-bit -- kill -HUP 1
-
-# 5. 更新 log-reader SHARD_MAP + 重新部署 aggregator（更新 SHARDS 數量）
+# 4. 更新 log-reader SHARD_MAP + aggregator SHARDS 數量
 make deploy-log-reader
 kubectl set env deployment/aggregator SHARDS=3 -n ea-tapinfra
 ```
 
-**跨日後（無需手動操作）：**
-- 新日期的 log 自動走新 SHARD_MAP → 進 vector-2
-- 舊日期的 log 依舊走舊 SHARD_MAP → 在原 shard
-- log-reader fallback + aggregator 全掃確保歷史查詢正常
-
-### 為什麼用日期而不是停機切換
-
-| | 停機換 MAP | 日期版本化 |
-|---|---|---|
-| 維護視窗 | 需要 | 不需要 |
-| 同日期資料跨 PVC | 可能 | 不會 |
-| 遲到的 log 路由正確 | 不一定 | ✅ |
-| S3 搬移資料完整 | 需確認 | ✅ |
+**注意：** FLB pod 使用 subPath mount，ConfigMap 更新不會自動生效，需等 pod 自然重啟（crash、維護）才會吃到新路由。重啟前後同一 toolid 的 log 可能落在不同 shard，aggregator 查詢時會自動 merge，資料不遺失。
 
 ## 常用指令
 

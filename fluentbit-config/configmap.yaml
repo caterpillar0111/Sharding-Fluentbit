@@ -33,8 +33,8 @@ data:
         Match  app.*
         Record toolid ${TOOL_ID}
 
-    # Step 2: Lua 依 log 的日期查對應版本的 SHARD_MAP，計算 shard_id
-    #         路由規則定義在 shard.lua，scale-up 時只改 shard.lua + SIGHUP
+    # Step 2: Lua 依 toolid 的 FNV-32a hash 計算 shard_id
+    #         路由規則定義在 shard.lua，scale-up 時改 SHARD_MAP + apply configmap
     [FILTER]
         Name    lua
         Match   app.*
@@ -72,37 +72,20 @@ data:
         Port          24224
         Retry_Limit   False
 
-  # ── Shard 路由規則（date-versioned）────────────────────────────────────────
+  # ── Shard 路由規則 ───────────────────────────────────────────────────────────
   #
   # scale-up 操作說明：
-  #   1. 在 SHARD_MAP_VERSIONS 最前面插入新版本（effective 設為跨日日期）
+  #   1. 修改 SHARD_MAP（新增 shard entry 或重新均分 slot）
   #   2. kubectl apply -f fluentbit-config/configmap.yaml
-  #   3. 對所有 FLB pod 執行 kill -HUP 1
-  #   4. 跨日後新日期的 log 自動走新 SHARD_MAP，舊日期不受影響
-  #
-  # 同步更新：helm/vector/values.yaml 的 shardMap 需與最新版本一致
+  #   3. 同步更新 helm/vector/values.yaml 的 shardMap，helm upgrade
+  #   （舊日期 log 若因此分散在不同 shard，aggregator 查詢時會自動 merge）
   #
   shard.lua: |
-    -- SHARD_MAP_VERSIONS：date-versioned 路由表
-    -- 按 effective 日期降序排列，最新版本在最前面
-    local SHARD_MAP_VERSIONS = {
-        -- ── 2026-04-01 擴充至 3 shards ──────────────────────────────────
-        {
-            effective = "2026-04-01",
-            map = {
-                {from=0,   to=84,  shard="0"},
-                {from=85,  to=170, shard="1"},
-                {from=171, to=255, shard="2"},
-            }
-        },
-        -- ── 初始版本（2 shards，永遠是最終 fallback）─────────────────────
-        {
-            effective = "2000-01-01",
-            map = {
-                {from=0,   to=127, shard="0"},
-                {from=128, to=255, shard="1"},
-            }
-        },
+    -- SHARD_MAP：slot (0~255) → shard 對應表
+    -- scale-up 時直接修改此表並 apply configmap
+    local SHARD_MAP = {
+        {from=0,   to=127, shard="0"},
+        {from=128, to=255, shard="1"},
     }
 
     local function fnv32a(s)
@@ -114,20 +97,9 @@ data:
         return h
     end
 
-    local function get_shard_map(date)
-        for _, v in ipairs(SHARD_MAP_VERSIONS) do
-            if date >= v.effective then
-                return v.map
-            end
-        end
-        return SHARD_MAP_VERSIONS[#SHARD_MAP_VERSIONS].map
-    end
-
     function compute_shard(tag, ts, record)
-        local date      = os.date("%Y-%m-%d", ts)
-        local shard_map = get_shard_map(date)
-        local slot      = math.abs(fnv32a(record["toolid"] or "")) % 256
-        for _, e in ipairs(shard_map) do
+        local slot = math.abs(fnv32a(record["toolid"] or "")) % 256
+        for _, e in ipairs(SHARD_MAP) do
             if slot >= e.from and slot <= e.to then
                 record["shard_id"] = e.shard
                 record["slot"]     = slot
