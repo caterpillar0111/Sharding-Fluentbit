@@ -126,7 +126,6 @@ Vector 透過 [helm/vector/](helm/vector/) chart 管理，主要參數在 [helm/
 |---|---|---|
 | `namespace` | `ea-tapinfra` | 部署目標 namespace |
 | `shards` | `2` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
-| `shardMap` | 見 values.yaml | log-reader 路由表，與 shard.lua 最新版本同步 |
 | `storage.size` | `10Gi` | 每個 shard 的 PVC 大小 |
 | `networkPolicy.enabled` | `true` | 是否啟用 NetworkPolicy |
 | `logReader.enabled` | `true` | 是否啟用 log-reader sidecar |

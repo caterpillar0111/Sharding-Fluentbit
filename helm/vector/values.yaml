@@ -6,12 +6,6 @@ namespace: ea-tapinfra
 # 擴充時只增加數字，現有 shard 不受影響
 shards: 2
 
-# SHARD_MAP：log-reader 使用的路由表，需與 fluentbit-config/shard.lua 的 SHARD_MAP 保持一致
-# scale-up 時同步修改兩處
-shardMap:
-  - {from: 0,   to: 127, shard: "0"}
-  - {from: 128, to: 255, shard: "1"}
-
 image:
   repository: timberio/vector
   tag: 0.41.X-debian

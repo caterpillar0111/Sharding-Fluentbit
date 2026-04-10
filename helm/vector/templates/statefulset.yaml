@@ -50,14 +50,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: NAMESPACE
-              value: {{ .Values.namespace }}
             - name: LOG_DIR
               value: /logs
             - name: PORT
               value: {{ .Values.logReader.port | quote }}
-            - name: SHARD_MAP
-              value: {{ include "vector.shardMap" . | quote }}
           volumeMounts:
             - name: log-storage
               mountPath: /logs
