@@ -35,6 +35,18 @@ Pod (tool-001)                 Pod (tool-002)
               │   Aggregator   │
               │  :8090 /logs   │
               │  /logs/all     │
+              └───────┬────────┘
+                      │ 每天 01:00 UTC
+              ┌───────▼────────┐
+              │  log-uploader  │
+              │  (CronJob)     │
+              └───────┬────────┘
+                      │
+              ┌───────▼────────┐
+              │     MinIO      │
+              │ logs/{date}/   │
+              │  {toolid}/     │
+              │  app.log       │
               └────────────────┘
 ```
 
@@ -68,6 +80,8 @@ namespace: ea-tapinfra（或其他 infra namespace）
 │   ├── container: vector         (log 接收與寫入 PVC)
 │   └── container: log-reader     (sidecar，Flask，提供 HTTP 查詢 API :8080)
 ├── Deployment: aggregator        (Flask，統一查詢入口 :8090)
+├── CronJob: log-uploader         (每天 01:00 UTC 將前一天 log 上傳 MinIO)
+├── Secret: minio-credentials     (MinIO access-key / secret-key)
 ├── Service: vector-0, vector-1, ...  (per-shard，含 port 8080)
 ├── Service: vector-headless  (StatefulSet 必要)
 ├── Service: aggregator  (port 8090)
@@ -109,6 +123,12 @@ make deploy-log-reader
 # 5. Build + 部署 Aggregator
 make deploy-aggregator
 
+# 6. 部署 MinIO（測試用，正式環境替換為外部 MinIO）
+#    見下方「MinIO 測試環境」
+
+# 7. 修改 cronjob/cronjob.yaml 填入 MinIO 憑證與 endpoint，再部署 CronJob
+make deploy-uploader
+
 # 或一次完成 Vector + Apps
 make deploy-all
 ```
@@ -125,7 +145,7 @@ Vector 透過 [helm/vector/](helm/vector/) chart 管理，主要參數在 [helm/
 | 參數 | 預設值 | 說明 |
 |---|---|---|
 | `namespace` | `ea-tapinfra` | 部署目標 namespace |
-| `shards` | `2` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
+| `shards` | `3` | Vector shard 數量（= StatefulSet replicas = PVC 數量）|
 | `storage.size` | `10Gi` | 每個 shard 的 PVC 大小 |
 | `networkPolicy.enabled` | `true` | 是否啟用 NetworkPolicy |
 | `logReader.enabled` | `true` | 是否啟用 log-reader sidecar |
@@ -343,9 +363,158 @@ curl http://localhost:2020/api/v1/storage
 - `shard_router.chunks.busy` — 正在 retry 中的 chunk 數
 - `shard_router.chunks.down` — 已 overflow 到磁碟的 chunk 數
 
+## Log Uploader（MinIO CronJob）
+
+每天 01:00 UTC 自動將前一天的所有 toolid log 上傳至 MinIO。
+
+### 目錄結構
+
+```
+cronjob/
+├── main.py        # 上傳邏輯（Python）
+├── Dockerfile
+└── cronjob.yaml   # K8s CronJob + Secret
+```
+
+### MinIO 測試環境（kind）
+
+在 `ea-tapinfra` namespace 部署一個輕量 MinIO：
+
+```bash
+kubectl apply -n ea-tapinfra -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadmin
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+EOF
+```
+
+MinIO Web Console（帳號 / 密碼：`minioadmin` / `minioadmin`）：
+
+```bash
+kubectl port-forward -n ea-tapinfra svc/minio 9001:9001
+# 開瀏覽器：http://localhost:9001
+# 手動建立 bucket 名稱：logs
+```
+
+### 設定 MinIO 憑證
+
+修改 [cronjob/cronjob.yaml](cronjob/cronjob.yaml) 中的 Secret：
+
+```yaml
+stringData:
+  access-key: "your-access-key"
+  secret-key: "your-secret-key"
+```
+
+並確認 `MINIO_ENDPOINT` 與 `MINIO_BUCKET` 環境變數正確。
+
+### 部署 CronJob
+
+```bash
+make deploy-uploader
+```
+
+### 手動觸發（測試用）
+
+CronJob 預設找「昨天」的資料，測試時可透過 `DATE` env var 指定日期：
+
+```bash
+# 刪舊 job（若有）
+kubectl delete job manual-test -n ea-tapinfra --ignore-not-found
+
+# 觸發並指定日期
+kubectl create job --from=cronjob/log-uploader manual-test -n ea-tapinfra \
+  --dry-run=client -o yaml \
+  | kubectl set env --local -f - DATE=2026-05-18 -o yaml \
+  | kubectl apply -f -
+
+# 查看執行結果
+kubectl logs -n ea-tapinfra job/manual-test -f
+```
+
+### 上傳結果確認
+
+```bash
+kubectl port-forward -n ea-tapinfra svc/minio 9001:9001 &
+# 開瀏覽器 http://localhost:9001 → logs bucket → logs/{date}/{toolid}/app.log
+```
+
+### MinIO Object 路徑
+
+```
+logs/
+└── {date}/              # e.g. 2026-05-18
+    ├── tool-001/
+    │   └── app.log      # 當日所有 log，按 timestamp 排序，跨 shard 已 merge
+    └── tool-002/
+        └── app.log
+```
+
+### 排序機制
+
+Log 行格式為：
+```
+2026-05-18 14:23:45.1234 [INFO] [toolid=tool-001] message
+```
+
+同一 toolid 若因 shard scale-up 或 hash mismatch 分散在多個 shard，Aggregator 會合併後，CronJob 以行首 23 字元（timestamp）做 lexicographic sort，確保上傳結果按時間順序排列。
+
+### CronJob 環境變數
+
+| 變數 | 預設值 | 說明 |
+|---|---|---|
+| `AGGREGATOR_URL` | — | Aggregator service URL，例如 `http://aggregator.ea-tapinfra:8090` |
+| `MINIO_ENDPOINT` | — | MinIO endpoint，例如 `minio.ea-tapinfra:9000` |
+| `MINIO_BUCKET` | `logs` | 目標 bucket 名稱 |
+| `MINIO_SECURE` | `false` | 是否使用 TLS |
+| `MINIO_ACCESS_KEY` | — | 來自 Secret |
+| `MINIO_SECRET_KEY` | — | 來自 Secret |
+| `DATE` | 昨天（UTC） | 覆蓋上傳日期，用於手動測試 |
+
+---
+
 ## 未來擴充
 
-- [ ] CronJob：每日將 PVC 內容上傳 S3 後清理本地
+- [x] CronJob：每日將 PVC 內容上傳 MinIO
+- [ ] 上傳後刪除 PVC 上的舊檔（需在 log-reader 新增 delete endpoint）
 - [ ] TLS：Fluent Bit → Vector 加密傳輸
 - [ ] 監控 PVC 用量：Prometheus alert 在快滿時通知
 - [ ] 修正 Lua FNV-32a hash bug（`bit.tobit(h*16777619)` → `bit.lshift` 實作），使 FLB 與 log-reader 使用相同 hash，消除 fallback 需求

@@ -1,0 +1,54 @@
+# MinIO 憑證 - 部署前請修改 access-key / secret-key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: ea-tapinfra
+stringData:
+  access-key: "minioadmin"
+  secret-key: "minioadmin"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: log-uploader
+  namespace: ea-tapinfra
+spec:
+  schedule: "0 1 * * *"      # 每天 01:00 UTC
+  concurrencyPolicy: Forbid   # 避免前一次還沒跑完就重複執行
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: log-uploader
+              image: log-uploader:latest
+              imagePullPolicy: Never
+              env:
+                - name: AGGREGATOR_URL
+                  value: "http://aggregator.ea-tapinfra:8090"
+                - name: MINIO_ENDPOINT
+                  value: "minio.ea-tapinfra:9000"
+                - name: MINIO_BUCKET
+                  value: "logs"
+                - name: MINIO_SECURE
+                  value: "false"
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: access-key
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: secret-key
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi

@@ -84,8 +84,9 @@ data:
     -- SHARD_MAP：slot (0~255) → shard 對應表
     -- scale-up 時直接修改此表並 apply configmap
     local SHARD_MAP = {
-        {from=0,   to=127, shard="0"},
-        {from=128, to=255, shard="1"},
+        {from=0,   to=84,  shard="0"},
+        {from=85,  to=169, shard="1"},
+        {from=170, to=255, shard="2"},
     }
 
     local function fnv32a(s)

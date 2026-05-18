@@ -1,6 +1,7 @@
 .PHONY: cluster-up cluster-down build load deploy-vector deploy-apps deploy-all logs-vector logs-tool status clean \
         build-log-reader load-log-reader deploy-log-reader \
-        build-aggregator load-aggregator deploy-aggregator query-log
+        build-aggregator load-aggregator deploy-aggregator query-log \
+        build-uploader load-uploader deploy-uploader
 
 CLUSTER_NAME    := log-poc
 IMAGE_NAME      := test-app
@@ -98,11 +99,25 @@ query-log:
 	curl -s "http://localhost:8090/logs?toolid=$(TOOL)" | python3 -m json.tool; \
 	kill $$PF_PID 2>/dev/null || true
 
+## ── Log Uploader (CronJob) ──────────────────────────────────────────────────
+
+UPLOADER_IMAGE := log-uploader
+
+build-uploader:
+	docker build -t $(UPLOADER_IMAGE):latest ./cronjob
+
+load-uploader: build-uploader
+	kind load docker-image $(UPLOADER_IMAGE):latest --name $(CLUSTER_NAME)
+
+deploy-uploader: load-uploader
+	kubectl apply -f cronjob/cronjob.yaml
+
 ## ── Cleanup ────────────────────────────────────────────────────────────────
 
 clean:
 	kubectl delete -f test-app/deployment.yaml --ignore-not-found
 	kubectl delete -f fluentbit-config/configmap.yaml --ignore-not-found
 	kubectl delete -f aggregator/deployment.yaml --ignore-not-found
+	kubectl delete -f cronjob/cronjob.yaml --ignore-not-found
 	helm uninstall $(HELM_RELEASE) -n $(VECTOR_NS) --ignore-not-found 2>/dev/null || true
 	kubectl delete namespace $(VECTOR_NS) --ignore-not-found

@@ -4,7 +4,7 @@ namespace: ea-tapinfra
 # Shard 數量 = StatefulSet replicas
 # 每個 shard 自動產生：一個 Pod、一個 PVC、一個 Service
 # 擴充時只增加數字，現有 shard 不受影響
-shards: 2
+shards: 3
 
 image:
   repository: timberio/vector
